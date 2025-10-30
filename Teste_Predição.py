@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import altair as alt
 from io import BytesIO
 from typing import Tuple
 
@@ -13,8 +14,6 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         cl = c.strip().lower()
         if "total" in cl and "pallet" in cl:
-            new_cols[c] = "TOTAL POR PALLET"
-        elif "total" in cl and "pallet" in cl:
             new_cols[c] = "TOTAL POR PALLET"
         elif "pallet" in cl and "unico" in cl:
             new_cols[c] = "PALLET UNICO"
@@ -179,107 +178,185 @@ col2.metric("Fim histórico", end_str)
 col3.metric("Semanas no histórico", f"{n_semanas:,}".replace(",", "."))
 
 st.subheader("📈 Série semanal (histórico)")
-if len(wk):
-    st.line_chart(wk.set_index("ds")["y"])
-else:
+if not len(wk):
     st.info("Sem dados no histórico para plotar.")
     st.stop()
 
-if not run_btn:
-    st.stop()
+# ===================== Modelagem (opcional via botão) =====================
+if run_btn:
+    with st.spinner("Treinando modelos..."):
+        best_name = None
+        metrics_note = ""
+        forecast_df = None
 
-# ===================== Modelagem =====================
-with st.spinner("Treinando modelos..."):
-    best_name = None
-    metrics_note = ""
-    forecast_df = None
+        future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
+        fh = len(future_idx)
 
-    future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
-    fh = len(future_idx)
+        try:
+            # ---------- PyCaret ----------
+            from pycaret.time_series import TSForecastingExperiment
 
-    try:
-        # ---------- PyCaret ----------
-        from pycaret.time_series import TSForecastingExperiment
+            exp = TSForecastingExperiment()
+            series = wk.set_index("ds")["y"].asfreq("W-MON")
 
-        exp = TSForecastingExperiment()
-        series = wk.set_index("ds")["y"].asfreq("W-MON")
+            exp.setup(
+                data=series,
+                fh=fh,
+                fold=3,
+                session_id=42,
+                verbose=False,
+                seasonal_period="auto",
+                imputation_method="ffill",
+                transform_target=True,
+            )
+            best = exp.compare_models(sort="MASE", n_select=1, turbo=True)
+            best_name = str(best)
+            final_best = exp.finalize_model(best)
+            preds = exp.predict_model(final_best, fh=fh)
 
-        exp.setup(
-            data=series,
-            fh=fh,
-            fold=3,
-            session_id=42,
-            verbose=False,
-            seasonal_period="auto",
-            imputation_method="ffill",
-            transform_target=True,
-        )
-        best = exp.compare_models(sort="MASE", n_select=1, turbo=True)
-        best_name = str(best)
-        final_best = exp.finalize_model(best)
-        preds = exp.predict_model(final_best, fh=fh)
-
-        # Normaliza saída
-        if isinstance(preds, pd.Series):
-            f = preds.rename("p50").to_frame()
-        else:
-            if "y_pred" in preds.columns:
-                f = preds[["y_pred"]].rename(columns={"y_pred": "p50"})
-            elif "Label" in preds.columns:
-                f = preds[["Label"]].rename(columns={"Label": "p50"})
+            # Normaliza saída
+            if isinstance(preds, pd.Series):
+                f = preds.rename("p50").to_frame()
             else:
-                f = preds.iloc[:, [-1]].rename(columns={preds.columns[-1]: "p50"})
-        f.index = pd.to_datetime(f.index)
-        f = f.reset_index().rename(columns={"index": "ds"})
-        f = f[(f["ds"] >= pd.Timestamp("2026-01-01")) & (f["ds"] <= pd.Timestamp("2026-12-31"))]
-        forecast_df = f.copy()
-        metrics_note = "Modelo selecionado via PyCaret (melhor por MASE)."
+                if "y_pred" in preds.columns:
+                    f = preds[["y_pred"]].rename(columns={"y_pred": "p50"})
+                elif "Label" in preds.columns:
+                    f = preds[["Label"]].rename(columns={"Label": "p50"})
+                else:
+                    f = preds.iloc[:, [-1]].rename(columns={preds.columns[-1]: "p50"})
+            f.index = pd.to_datetime(f.index)
+            f = f.reset_index().rename(columns={"index": "ds"})
+            f = f[(f["ds"] >= pd.Timestamp("2026-01-01")) & (f["ds"] <= pd.Timestamp("2026-12-31"))]
+            forecast_df = f.copy()
+            metrics_note = "Modelo selecionado via PyCaret (melhor por MASE)."
 
-    except Exception as e:
-        # ---------- Fallback: sazonalidade por semana do ano ----------
-        metrics_note = f"PyCaret indisponível ({e}). Usando fallback sazonal (média por semana do ano)."
-        hist = wk.copy()
-        hist["week"] = hist["ds"].dt.isocalendar().week.astype(int)
-        seasonal = hist.groupby("week")["y"].mean()
-        fut = pd.DataFrame({"ds": future_idx})
-        fut["week"] = fut["ds"].dt.isocalendar().week.astype(int)
-        fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
-        forecast_df = fut[["ds", "p50"]].copy()
-        best_name = "Sazonal (média por semana do ano)"
+        except Exception as e:
+            # ---------- Fallback: sazonalidade por semana do ano ----------
+            metrics_note = f"PyCaret indisponível ({e}). Usando fallback sazonal (média por semana do ano)."
+            hist = wk.copy()
+            hist["week"] = hist["ds"].dt.isocalendar().week.astype(int)
+            seasonal = hist.groupby("week")["y"].mean()
+            fut = pd.DataFrame({"ds": future_idx})
+            fut["week"] = fut["ds"].dt.isocalendar().week.astype(int)
+            fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
+            forecast_df = fut[["ds", "p50"]].copy()
+            best_name = "Sazonal (média por semana do ano)"
 
-# ===================== Resultados =====================
-st.subheader("🤖 Modelo escolhido")
-st.write(best_name)
-st.caption(metrics_note)
+    st.subheader("Modelo escolhido")
+    st.write(best_name)
+    st.caption(metrics_note)
 
-# Plot histórico + previsão
-hist_df = wk.copy()
-hist_df["tipo"] = "Histórico"
-fc_plot = forecast_df.copy()
-fc_plot["tipo"] = "Previsão 2026 (p50)"
-plot_df = pd.concat([
-    hist_df.rename(columns={"y": "valor"})[["ds", "valor", "tipo"]],
-    fc_plot.rename(columns={"p50": "valor"})[["ds", "valor", "tipo"]],
-], ignore_index=True)
+    # Plot histórico + previsão (com Altair e rótulos)
+    hist_df = wk.copy()
+    hist_df["tipo"] = "Histórico"
+    fc_plot = forecast_df.copy()
+    fc_plot["tipo"] = "Previsão 2026 (p50)"
+    plot_df = pd.concat([
+        hist_df.rename(columns={"y": "valor"})[["ds", "valor", "tipo"]],
+        fc_plot.rename(columns={"p50": "valor"})[["ds", "valor", "tipo"]],
+    ], ignore_index=True)
 
-st.subheader(f"📊 {y_label}")
-st.line_chart(plot_df.pivot(index="ds", columns="tipo", values="valor"))
+    st.subheader(f"📊 {y_label}")
 
-# Agregado mensal + total
-forecast_df["ano"] = forecast_df["ds"].dt.year
-forecast_df["mes"] = forecast_df["ds"].dt.month
-mensal = forecast_df.groupby(["ano", "mes"], as_index=False).agg(p50=("p50", "sum"))
-total_2026 = float(forecast_df["p50"].sum())
+    with st.expander("⚙️ Opções do gráfico"):
+        show_points = st.checkbox("Mostrar marcadores nos pontos", value=True)
+        show_labels = st.checkbox("Mostrar valores como rótulos", value=True)
+        label_every = st.number_input("Exibir rótulo a cada N pontos", min_value=1, max_value=52, value=4, step=1)
+        label_only_2026 = st.checkbox("Rótulos apenas na previsão 2026", value=True)
 
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("### 📦 Previsão semanal 2026 (p50)")
-    st.dataframe(forecast_df, use_container_width=True)
-    _download_csv(forecast_df, f"forecast_2026_{target_mode}_semanal.csv")
-with c2:
-    st.markdown("### 🗓️ Previsão mensal 2026 (p50)")
-    st.dataframe(mensal, use_container_width=True)
-    _download_csv(mensal, f"forecast_2026_{target_mode}_mensal.csv")
+    plot_df2 = plot_df.copy()
+    plot_df2["valor_fmt"] = plot_df2["valor"].round(0)
+    plot_df2 = plot_df2.sort_values("ds")
+    plot_df2["idx"] = plot_df2.groupby("tipo").cumcount()
 
-st.success(f"TOTAL 2026 (p50): {total_2026:,.0f}")
-st.caption("Dica: para rodar por segmento/UF, filtre e repita o pipeline para cada grupo; depois some as previsões.")
+    if label_only_2026:
+        mask_rotulo = (plot_df2["tipo"].str.contains("Previsão", na=False)) & (plot_df2["idx"] % label_every == 0)
+    else:
+        mask_rotulo = (plot_df2["idx"] % label_every == 0)
+
+    plot_df_labels = plot_df2.loc[mask_rotulo].copy()
+
+    base = alt.Chart(plot_df2).encode(
+        x=alt.X('ds:T', title='Data'),
+        y=alt.Y('valor:Q', title=y_label),
+        color=alt.Color('tipo:N', title='Série'),
+        tooltip=[
+            alt.Tooltip('ds:T', title='Data'),
+            alt.Tooltip('tipo:N', title='Série'),
+            alt.Tooltip('valor_fmt:Q', title='Valor')
+        ]
+    )
+
+    line = base.mark_line()
+    points = base.mark_point() if show_points else alt.Chart()
+
+    if show_labels:
+        text = alt.Chart(plot_df_labels).mark_text(align='left', dx=5, dy=-5).encode(
+            x='ds:T',
+            y='valor:Q',
+            text=alt.Text('valor_fmt:Q'),
+            color='tipo:N'
+        )
+        chart = (line + points + text).interactive()
+    else:
+        chart = (line + points).interactive()
+
+    st.altair_chart(chart, use_container_width=True)
+
+    # Agregado mensal + total
+    forecast_df["ano"] = forecast_df["ds"].dt.year
+    forecast_df["mes"] = forecast_df["ds"].dt.month
+    mensal = forecast_df.groupby(["ano", "mes"], as_index=False).agg(p50=("p50", "sum"))
+    total_2026 = float(forecast_df["p50"].sum())
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### 📦 Previsão semanal 2026 (p50)")
+        st.dataframe(forecast_df, use_container_width=True)
+        _download_csv(forecast_df, f"forecast_2026_{target_mode}_semanal.csv")
+    with c2:
+        st.markdown("### 🗓️ Previsão mensal 2026 (p50)")
+        st.dataframe(mensal, use_container_width=True)
+        _download_csv(mensal, f"forecast_2026_{target_mode}_mensal.csv")
+
+    st.success(f"TOTAL 2026 (p50): {total_2026:,.0f}")
+
+else:
+    # Se ainda não clicou em treinar, pelo menos mostre o histórico com Altair já com labels
+    st.subheader(f"📊 {y_label} (histórico)")
+    with st.expander("⚙️ Opções do gráfico"):
+        show_points = st.checkbox("Mostrar marcadores nos pontos", value=True, key="hist_points")
+        show_labels = st.checkbox("Mostrar valores como rótulos", value=False, key="hist_labels")
+        label_every = st.number_input("Exibir rótulo a cada N pontos", min_value=1, max_value=52, value=4, step=1, key="hist_every")
+
+    hist_plot = wk.copy().rename(columns={"y": "valor"})
+    hist_plot["tipo"] = "Histórico"
+    hist_plot["valor_fmt"] = hist_plot["valor"].round(0)
+    hist_plot = hist_plot.sort_values("ds")
+    hist_plot["idx"] = hist_plot.groupby("tipo").cumcount()
+    mask_rotulo = (hist_plot["idx"] % label_every == 0)
+    hist_labels = hist_plot.loc[mask_rotulo].copy()
+
+    base_h = alt.Chart(hist_plot).encode(
+        x=alt.X('ds:T', title='Data'),
+        y=alt.Y('valor:Q', title=y_label),
+        color=alt.Color('tipo:N', title='Série'),
+        tooltip=[
+            alt.Tooltip('ds:T', title='Data'),
+            alt.Tooltip('valor_fmt:Q', title='Valor')
+        ]
+    )
+    line_h = base_h.mark_line()
+    points_h = base_h.mark_point() if show_points else alt.Chart()
+    if show_labels:
+        text_h = alt.Chart(hist_labels).mark_text(align='left', dx=5, dy=-5).encode(
+            x='ds:T',
+            y='valor:Q',
+            text=alt.Text('valor_fmt:Q'),
+            color='tipo:N'
+        )
+        chart_h = (line_h + points_h + text_h).interactive()
+    else:
+        chart_h = (line_h + points_h).interactive()
+
+    st.altair_chart(chart_h, use_container_width=True)
