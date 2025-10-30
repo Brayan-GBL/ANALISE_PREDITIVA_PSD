@@ -132,7 +132,7 @@ def _download_csv(df: pd.DataFrame, filename: str):
 st.sidebar.title("Configuração")
 st.sidebar.markdown(
     "Envie **ANALISE_PSD** (CSV/Excel) com as colunas:\n"
-    "- **PALLET UNICO**\n- **DATA TRIAGEM UNICO**\n- **DATA RECEBIMENTO UNICO**\n- **TOTAL POR PALLET** *(aceito e normalizado p/ TOTAL POR PALLET)*"
+    "- **PALLET UNICO**\n- **DATA TRIAGEM UNICO**\n- **DATA RECEBIMENTO UNICO**\n- **TOTAL POR PALLET**"
 )
 target_mode = st.sidebar.radio("Alvo da previsão", ["pallets", "materiais"], index=0)
 uploaded = st.sidebar.file_uploader("Enviar arquivo (ANALISE_PSD)", type=["csv", "xlsx", "xls"])
