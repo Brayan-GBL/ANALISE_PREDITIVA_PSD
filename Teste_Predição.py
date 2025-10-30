@@ -123,7 +123,7 @@ target_mode = st.sidebar.radio("Alvo da previsão", ["pallets", "materiais"], in
 uploaded = st.sidebar.file_uploader("Enviar arquivo (ANALISE_PSD)", type=["csv", "xlsx", "xls"])
 run_btn = st.sidebar.button("Treinar e Prever 2026")
 
-st.title("🔮 Previsão 2026 • Pallets / Materiais (semanal)")
+st.title(" Previsão 2026 • Pallets / Materiais (semanal)")
 st.caption("Imputação de datas (recebimento prioritário; triagem − mediana do atraso como fallback) + AutoML (PyCaret).")
 
 # ============== Main ==============
