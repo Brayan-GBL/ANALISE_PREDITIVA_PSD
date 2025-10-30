@@ -1,5 +1,5 @@
-streamlit>=1.36
-pycaret[time_series]==3.3.2
-pandas>=2.0,<2.3
-scikit-learn>=1.2,<1.4
-numpy>=1.23,<2.0
+streamlit
+pycaret
+pandas
+scikit-learn
+numpy
