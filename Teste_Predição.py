@@ -13,8 +13,8 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = {}
     for c in df.columns:
         cl = c.strip().lower()
-        # mapeia "toral por pallet" -> "total por pallet"
-        if "toral" in cl and "pallet" in cl:
+        # mapeia "total por pallet" -> "total por pallet"
+        if "total" in cl and "pallet" in cl:
             new_cols[c] = "TOTAL POR PALLET"
         elif "pallet" in cl and "unico" in cl:
             new_cols[c] = "PALLET UNICO"
@@ -117,7 +117,7 @@ def _download_csv(df: pd.DataFrame, filename: str):
 # ============== Sidebar / Inputs ==============
 st.sidebar.title("Configuração")
 st.sidebar.markdown("Carregue **ANALISE_PSD** (CSV ou Excel) com as colunas:\n\n"
-                    "- PALLET UNICO\n- DATA TRIAGEM UNICO\n- DATA RECEBIMENTO UNICO\n- TORAL POR PALLET (aceito)\n")
+                    "- PALLET UNICO\n- DATA TRIAGEM UNICO\n- DATA RECEBIMENTO UNICO\n- TOTAL POR PALLET (aceito)\n")
 target_mode = st.sidebar.radio("Alvo da previsão", ["pallets", "materiais"], index=0,
                                help="pallets = contagem de pallets por semana; materiais = soma TOTAL_POR_PALLET por semana")
 uploaded = st.sidebar.file_uploader("Enviar arquivo (ANALISE_PSD)", type=["csv", "xlsx", "xls"])
