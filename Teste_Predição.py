@@ -35,9 +35,8 @@ def _read_any(file) -> pd.DataFrame:
 
 def _build_arrival_date(df: pd.DataFrame) -> pd.Series:
     """
-    Cria 'data_chegada' priorizando DATA RECEBIMENTO UNICO.
-    Se faltar e houver DATA TRIAGEM UNICO, usa triagem - mediana_do_atraso(triagem - recebimento, truncado em 0).
-    Se ambas faltarem, fica NaT (linha será descartada depois).
+    data_chegada: prioriza RECEBIMENTO; se faltar e existir TRIAGEM,
+    usa TRIAGEM - mediana(max(TRIAGEM-RECEBIMENTO,0)).
     """
     col_rec = "DATA RECEBIMENTO UNICO"
     col_tri = "DATA TRIAGEM UNICO"
@@ -60,16 +59,11 @@ def _build_arrival_date(df: pd.DataFrame) -> pd.Series:
 
     return pd.to_datetime(chegada)
 
-def _weekly_agg(
-    df: pd.DataFrame,
-    target_mode: str,
-    freq: str = "W-MON"
-) -> Tuple[pd.DataFrame, str]:
+def _weekly_agg(df: pd.DataFrame, target_mode: str, freq: str = "W-MON") -> Tuple[pd.DataFrame, str]:
     """
-    Aggrega semanalmente:
-      - pallets: nº de 'PALLET UNICO' distintos por semana
-      - materiais: soma de 'TOTAL POR PALLET' por semana
-    Retorna DataFrame com colunas [ds, y] e o label do alvo.
+    Retorna série semanal: [ds, y]
+      - pallets: nº de PALLET UNICO distintos
+      - materiais: soma de TOTAL POR PALLET
     """
     df = df.copy()
     df["data_chegada"] = _build_arrival_date(df)
@@ -79,22 +73,20 @@ def _weekly_agg(
         raise ValueError("Coluna 'PALLET UNICO' não encontrada no arquivo.")
     if target_mode == "materiais":
         if "TOTAL POR PALLET" not in df.columns:
-            raise ValueError("Coluna 'TOTAL POR PALLET' não encontrada para soma de materiais.")
+            raise ValueError("Coluna 'TOTAL POR PALLET' não encontrada.")
         df["TOTAL POR PALLET"] = pd.to_numeric(df["TOTAL POR PALLET"], errors="coerce").fillna(0)
 
     if target_mode == "pallets":
-        agg = (df
-               .groupby(pd.Grouper(key="data_chegada", freq=freq))
-               .agg(y=("PALLET UNICO", "nunique"))
-               .reset_index()
-               .rename(columns={"data_chegada": "ds"}))
+        agg = (df.groupby(pd.Grouper(key="data_chegada", freq=freq))
+                 .agg(y=("PALLET UNICO", "nunique"))
+                 .reset_index()
+                 .rename(columns={"data_chegada": "ds"}))
         label = "Pallets (nº únicos por semana)"
     else:
-        agg = (df
-               .groupby(pd.Grouper(key="data_chegada", freq=freq))
-               .agg(y=("TOTAL POR PALLET", "sum"))
-               .reset_index()
-               .rename(columns={"data_chegada": "ds"}))
+        agg = (df.groupby(pd.Grouper(key="data_chegada", freq=freq))
+                 .agg(y=("TOTAL POR PALLET", "sum"))
+                 .reset_index()
+                 .rename(columns={"data_chegada": "ds"}))
         label = "Materiais (soma por semana)"
 
     if len(agg) == 0:
@@ -108,7 +100,7 @@ def _weekly_agg(
     return out, label
 
 def _compute_future_index(last_ds: pd.Timestamp, end_year: int = 2026, freq: str = "W-MON") -> pd.DatetimeIndex:
-    """Cria índice semanal de (próxima semana) até 31/12/end_year, filtrando só 2026."""
+    """Índice semanal de (próxima segunda) até 31/12/end_year; filtra só 2026."""
     if pd.isna(last_ds):
         start = pd.Timestamp(f"{end_year}-01-01")
     else:
@@ -122,9 +114,18 @@ def _download_csv(df: pd.DataFrame, filename: str):
     st.download_button("⬇️ Baixar CSV", data=df.to_csv(index=False).encode("utf-8"),
                        file_name=filename, mime="text/csv")
 
-# ===================== Model (sklearn) =====================
+# ===================== Baseline (média por semana do ano) =====================
+def _seasonal_fallback(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
+    hist = wk_df.copy()
+    hist["week"] = hist["ds"].dt.isocalendar().week.astype(int)
+    seasonal = hist.groupby("week")["y"].mean()
+    fut = pd.DataFrame({"ds": future_idx})
+    fut["week"] = fut["ds"].dt.isocalendar().week.astype(int)
+    fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
+    return fut[["ds", "p50"]]
+
+# ===================== Features p/ modelo =====================
 def _select_lags(n_points: int) -> List[int]:
-    """Define lags dinamicamente conforme tamanho do histórico."""
     base = [1, 2, 4, 8, 12, 26, 52]
     return [L for L in base if L < n_points]
 
@@ -139,104 +140,110 @@ def _make_features(wk_df: pd.DataFrame, lags: List[int], rolls: Optional[List[in
             df[f"rollmean_{W}"] = df["y"].shift(1).rolling(W).mean()
     return df.dropna().reset_index(drop=True)
 
-def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
-    """HistGradientBoosting com CV temporal + previsão recursiva, mantendo o MESMO espaço de features do treino."""
-    n = len(wk_df)
-    lags_all = _select_lags(n) or [1]                 # ex.: [1,2,4,8,12,26,52] filtrado por n; se vazio, usa [1]
-    rolls_all = [x for x in [4, 8, 12, 26] if x < n]  # rollings possíveis dado o tamanho do histórico
+def _add_fourier(df, date_col="ds", period=52, K=2):
+    df = df.copy()
+    w = df[date_col].dt.isocalendar().week.astype(int)
+    for k in range(1, K+1):
+        df[f"fourier_sin_{k}"] = np.sin(2*np.pi*k*w/period)
+        df[f"fourier_cos_{k}"] = np.cos(2*np.pi*k*w/period)
+    return df
 
-    # 1) Monta features do histórico (treino)
+# ===================== Modelo (sklearn) =====================
+def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex, target_mode: str):
+    """
+    HistGradientBoosting com:
+      - loss='poisson' para pallets, 'squared_error' para materiais
+      - cap de outliers (p99)
+      - Fourier (sazonalidade semanal)
+      - previsão recursiva estável mantendo MESMO espaço de features
+    """
+    n = len(wk_df)
+    lags_all = _select_lags(n) or [1]
+    rolls_all = [x for x in [4, 8, 12, 26] if x < n]
+
     feat = _make_features(wk_df, lags_all, rolls_all)
     if feat.empty:
-        # histórico curto demais -> fallback sazonal
         return _seasonal_fallback(wk_df, future_idx), None
 
-    # Colunas de features (ordem fixa) usadas no treino
-    feature_cols = [c for c in feat.columns if c not in ["ds", "y"]]
-    y = feat["y"].values
-    X = feat[feature_cols].values
+    feat = _add_fourier(feat, date_col="ds", period=52, K=2)
 
-    # 2) CV temporal (ajusta n_splits se necessário)
+    y = feat["y"].astype(float).values
+    p_hi = np.percentile(y, 99) if len(y) >= 20 else y.max()
+    y_cap = np.clip(y, 0, p_hi)
+
+    feature_cols = [c for c in feat.columns if c not in ["ds", "y"]]
+    X = feat[feature_cols].astype(float).values
+
+    # CV temporal (com redução automática de splits)
     maes = []
     splits = 4
     while splits > 1:
         try:
             tscv = TimeSeriesSplit(n_splits=splits)
             for tr, te in tscv.split(X):
-                m = HistGradientBoostingRegressor(random_state=42)
-                m.fit(X[tr], y[tr])
+                loss = "poisson" if target_mode == "pallets" else "squared_error"
+                m = HistGradientBoostingRegressor(random_state=42, loss=loss)
+                m.fit(X[tr], y_cap[tr])
                 p = m.predict(X[te])
-                maes.append(mean_absolute_error(y[te], p))
+                maes.append(mean_absolute_error(y_cap[te], p))
             break
         except Exception:
             splits -= 1
     mae_cv = float(np.median(maes)) if maes else None
 
-    # 3) Treino final no histórico todo (mesmo espaço de features)
-    final = HistGradientBoostingRegressor(random_state=42)
-    final.fit(X, y)
+    # Treino final
+    loss = "poisson" if target_mode == "pallets" else "squared_error"
+    final = HistGradientBoostingRegressor(random_state=42, loss=loss)
+    final.fit(X, y_cap)
 
-    # 4) Previsão recursiva: SEMPRE respeitando `feature_cols`
+    # Previsão recursiva respeitando feature_cols
     hist_for_fc = feat[["ds", "y"]].copy()
     rows = []
-
     for d in future_idx:
-        s = hist_for_fc["y"]
+        s = hist_for_fc["y"].astype(float)
         curr_len = len(s)
-        last_val = float(s.iloc[-1]) if curr_len > 0 else 0.0
+        last_val = float(s.iloc[-1]) if curr_len else 0.0
 
-        # Monta um dict com TODAS as colunas de feature usadas no treino
+        row = {"week": int(d.isocalendar().week), "month": int(d.month)}
+        # preencher TODAS as features na MESMA ORDEM
         row_feat = {}
         for col in feature_cols:
             if col == "week":
-                row_feat[col] = int(d.isocalendar().week)
+                row_feat[col] = row["week"]
             elif col == "month":
-                row_feat[col] = int(d.month)
+                row_feat[col] = row["month"]
             elif col.startswith("lag_"):
-                # lag_L -> usa s[-L] se existir; senão, fallback = último valor conhecido
                 try:
                     L = int(col.split("_", 1)[1])
                 except Exception:
                     L = 1
-                if curr_len >= L:
-                    row_feat[col] = float(s.iloc[-L])
-                else:
-                    row_feat[col] = last_val
+                row_feat[col] = float(s.iloc[-L]) if curr_len >= L else last_val
             elif col.startswith("rollmean_"):
-                # rollmean_W -> média dos últimos W; se W > histórico, usa média do que tiver; se vazio, usa last_val
                 try:
                     W = int(col.split("_", 1)[1])
                 except Exception:
-                    W = min(4, curr_len)
-                window = min(W, curr_len)
-                row_feat[col] = float(s.iloc[-window:].mean()) if window > 0 else last_val
+                    W = min(4, curr_len or 1)
+                w = min(W, curr_len)
+                row_feat[col] = float(s.iloc[-w:].mean()) if w > 0 else last_val
+            elif col.startswith("fourier_sin_"):
+                k = int(col.split("_")[-1])
+                row_feat[col] = np.sin(2*np.pi*k*row["week"]/52)
+            elif col.startswith("fourier_cos_"):
+                k = int(col.split("_")[-1])
+                row_feat[col] = np.cos(2*np.pi*k*row["week"]/52)
             else:
-                # Qualquer coluna inesperada recebe fallback neutro
                 row_feat[col] = last_val
 
-        # Garante MESMA ORDEM de colunas que no treino
         Xn = np.array([[row_feat[c] for c in feature_cols]], dtype=float)
-
-        # Predição e atualização do histórico para o próximo passo
         yhat = float(final.predict(Xn))
-        yhat = max(0.0, yhat)  # sem negativos
+        yhat = max(0.0, yhat)
         rows.append({"ds": d, "p50": yhat})
         hist_for_fc = pd.concat([hist_for_fc, pd.DataFrame([{"ds": d, "y": yhat}])], ignore_index=True)
 
     fc = pd.DataFrame(rows)
     return fc, mae_cv
 
-def _seasonal_fallback(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
-    """Média por semana do ano, fallback simples e robusto."""
-    hist = wk_df.copy()
-    hist["week"] = hist["ds"].dt.isocalendar().week.astype(int)
-    seasonal = hist.groupby("week")["y"].mean()
-    fut = pd.DataFrame({"ds": future_idx})
-    fut["week"] = fut["ds"].dt.isocalendar().week.astype(int)
-    fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
-    return fut[["ds", "p50"]]
-
-# ============== Sidebar / Inputs ==============
+# ===================== Sidebar / Inputs =====================
 st.sidebar.title("Configuração")
 st.sidebar.markdown(
     "Envie **ANALISE_PSD** (CSV/Excel) com as colunas:\n"
@@ -244,12 +251,15 @@ st.sidebar.markdown(
 )
 target_mode = st.sidebar.radio("Alvo da previsão", ["pallets", "materiais"], index=0)
 uploaded = st.sidebar.file_uploader("Enviar arquivo (ANALISE_PSD)", type=["csv", "xlsx", "xls"])
-run_btn = st.sidebar.button("Treinar e Prever 2026")
+
+# Botões
+train_btn = st.sidebar.button("🚀 Treinar / Atualizar previsão 2026", type="primary")
+show_baseline = st.sidebar.checkbox("➕ Mostrar baseline sazonal (média por semana do ano)", value=False)
 
 st.title("Previsão 2026 • Pallets / Materiais (semanal)")
 st.caption("Imputação de datas: Recebimento prioritário; se ausente, usa Triagem − mediana do atraso (triagem−recebimento).")
 
-# ============== Main ==============
+# ===================== Main =====================
 if uploaded is None:
     st.info("Envie o arquivo **ANALISE_PSD** na barra lateral para começar.")
     st.stop()
@@ -262,7 +272,6 @@ except Exception as e:
     st.stop()
 
 raw = _normalize_cols(raw)
-
 with st.expander("🔎 Prévia dos dados"):
     st.dataframe(raw.head(30), use_container_width=True)
 
@@ -273,107 +282,139 @@ except Exception as e:
     st.error(f"Erro no pré-processamento: {e}")
     st.stop()
 
-# --- Métricas (em STRING) ---
+# Métricas
 start_ds = wk["ds"].min() if len(wk) else pd.NaT
 end_ds = wk["ds"].max() if len(wk) else pd.NaT
 start_str = start_ds.strftime("%Y-%m-%d") if pd.notna(start_ds) else "—"
 end_str = end_ds.strftime("%Y-%m-%d") if pd.notna(end_ds) else "—"
 n_semanas = int(len(wk)) if len(wk) else 0
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Início histórico", start_str)
-col2.metric("Fim histórico", end_str)
-col3.metric("Semanas no histórico", f"{n_semanas:,}".replace(",", "."))
+c1, c2, c3 = st.columns(3)
+c1.metric("Início histórico", start_str)
+c2.metric("Fim histórico", end_str)
+c3.metric("Semanas no histórico", f"{n_semanas:,}".replace(",", "."))
 
 st.subheader("📈 Série semanal (histórico)")
 if not len(wk):
     st.info("Sem dados no histórico para plotar.")
     st.stop()
 
-# ===================== Modelagem (sklearn) =====================
-if run_btn:
-    with st.spinner("Treinando e prevendo..."):
-        future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
-        if len(future_idx) == 0:
-            st.error("Não há semanas de 2026 a prever com a frequência atual.")
-            st.stop()
+# ========== Treinamento (persistente) ==========
+future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
 
-        forecast_df, mae_cv = _forecast_sklearn(wk, future_idx)
-        best_name = "HistGradientBoosting (scikit-learn)"
-        metrics_note = f"Backtest MAE (mediano): {mae_cv:.2f}" if mae_cv is not None else "Backtest indisponível (histórico curto)."
+if train_btn or "model_result" not in st.session_state or st.session_state.get("last_target_mode") != target_mode:
+    with st.spinner("Treinando e gerando previsão..."):
+        fc_model, mae_cv = _forecast_sklearn(wk, future_idx, target_mode)
+        st.session_state.model_result = {
+            "forecast_df": fc_model,
+            "mae_cv": mae_cv,
+            "best_name": "HistGradientBoosting (scikit-learn) com Fourier",
+            "metrics_note": f"Backtest MAE (mediano): {mae_cv:.2f}" if mae_cv is not None else "Backtest indisponível (histórico curto).",
+        }
+        st.session_state.last_target_mode = target_mode
 
+# Sempre disponível após treinar pelo menos 1x
+fc_model = st.session_state.get("model_result", {}).get("forecast_df")
+mae_cv = st.session_state.get("model_result", {}).get("mae_cv")
+best_name = st.session_state.get("model_result", {}).get("best_name", "—")
+metrics_note = st.session_state.get("model_result", {}).get("metrics_note", "—")
+
+# Baseline opcional (não substitui o modelo; é só comparação)
+fc_base = _seasonal_fallback(wk, future_idx) if show_baseline else None
+
+# ========== Gráficos (com rótulos para todas as séries) ==========
+hist_df = wk.copy()
+hist_df["tipo"] = "Histórico"
+hist_df = hist_df.rename(columns={"y": "valor"})[["ds", "valor", "tipo"]]
+
+series_to_concat = [hist_df]
+
+if isinstance(fc_model, pd.DataFrame) and len(fc_model):
+    tmp = fc_model.copy()
+    tmp["tipo"] = "Previsão 2026 (p50)"
+    tmp = tmp.rename(columns={"p50": "valor"})[["ds", "valor", "tipo"]]
+    series_to_concat.append(tmp)
+
+if isinstance(fc_base, pd.DataFrame) and len(fc_base):
+    tmpb = fc_base.copy()
+    tmpb["tipo"] = "Baseline sazonal (p50)"
+    tmpb = tmpb.rename(columns={"p50": "valor"})[["ds", "valor", "tipo"]]
+    series_to_concat.append(tmpb)
+
+plot_df = pd.concat(series_to_concat, ignore_index=True)
+plot_df["valor_fmt"] = plot_df["valor"].round(0)
+plot_df = plot_df.sort_values("ds")
+plot_df["idx"] = plot_df.groupby("tipo").cumcount()
+
+st.subheader(f"📊 {y_label}")
+
+with st.expander("⚙️ Opções do gráfico"):
+    # Guardar opções no estado para não resetar após interação
+    if "opt_points" not in st.session_state: st.session_state.opt_points = True
+    if "opt_labels" not in st.session_state: st.session_state.opt_labels = True
+    if "opt_label_every" not in st.session_state: st.session_state.opt_label_every = 4
+    if "opt_label_scope" not in st.session_state: st.session_state.opt_label_scope = "Todos"
+
+    st.session_state.opt_points = st.checkbox("Mostrar marcadores nos pontos", value=st.session_state.opt_points)
+    st.session_state.opt_labels = st.checkbox("Mostrar valores como rótulos", value=st.session_state.opt_labels)
+    st.session_state.opt_label_every = st.number_input("Exibir rótulo a cada N pontos", min_value=1, max_value=52,
+                                                       value=st.session_state.opt_label_every, step=1)
+    st.session_state.opt_label_scope = st.selectbox(
+        "Séries com rótulo",
+        ["Todos", "Histórico", "Previsão 2026 (p50)", "Baseline sazonal (p50)"],
+        index=["Todos","Histórico","Previsão 2026 (p50)","Baseline sazonal (p50)"].index(st.session_state.opt_label_scope)
+    )
+
+# Filtragem para rótulos
+every = int(st.session_state.opt_label_every)
+if st.session_state.opt_label_scope == "Todos":
+    mask_lbl = (plot_df["idx"] % every == 0)
+else:
+    mask_lbl = (plot_df["tipo"] == st.session_state.opt_label_scope) & (plot_df["idx"] % every == 0)
+plot_labels = plot_df.loc[mask_lbl].copy()
+
+base = alt.Chart(plot_df).encode(
+    x=alt.X('ds:T', title='Data'),
+    y=alt.Y('valor:Q', title=y_label),
+    color=alt.Color('tipo:N', title='Série'),
+    tooltip=[
+        alt.Tooltip('ds:T', title='Data'),
+        alt.Tooltip('tipo:N', title='Série'),
+        alt.Tooltip('valor_fmt:Q', title='Valor')
+    ]
+)
+
+line = base.mark_line()
+points = base.mark_point() if st.session_state.opt_points else alt.Chart()
+
+if st.session_state.opt_labels:
+    text = alt.Chart(plot_labels).mark_text(align='left', dx=5, dy=-5).encode(
+        x='ds:T', y='valor:Q', text=alt.Text('valor_fmt:Q'), color='tipo:N'
+    )
+    chart = (line + points + text).interactive()
+else:
+    chart = (line + points).interactive()
+
+st.altair_chart(chart, use_container_width=True)
+
+# ========== Bloco de resultados ==========
+if isinstance(fc_model, pd.DataFrame) and len(fc_model):
     st.subheader("Modelo escolhido")
     st.write(best_name)
     st.caption(metrics_note)
 
-    # Plot histórico + previsão (Altair com rótulos)
-    hist_df = wk.copy()
-    hist_df["tipo"] = "Histórico"
-    fc_plot = forecast_df.copy()
-    fc_plot["tipo"] = "Previsão 2026 (p50)"
-    plot_df = pd.concat([
-        hist_df.rename(columns={"y": "valor"})[["ds", "valor", "tipo"]],
-        fc_plot.rename(columns={"p50": "valor"})[["ds", "valor", "tipo"]],
-    ], ignore_index=True)
-
-    st.subheader(f"📊 {y_label}")
-
-    with st.expander("⚙️ Opções do gráfico"):
-        show_points = st.checkbox("Mostrar marcadores nos pontos", value=True)
-        show_labels = st.checkbox("Mostrar valores como rótulos", value=True)
-        label_every = st.number_input("Exibir rótulo a cada N pontos", min_value=1, max_value=52, value=4, step=1)
-        label_only_2026 = st.checkbox("Rótulos apenas na previsão 2026", value=True)
-
-    plot_df2 = plot_df.copy()
-    plot_df2["valor_fmt"] = plot_df2["valor"].round(0)
-    plot_df2 = plot_df2.sort_values("ds")
-    plot_df2["idx"] = plot_df2.groupby("tipo").cumcount()
-
-    if label_only_2026:
-        mask_rotulo = (plot_df2["tipo"].str.contains("Previsão", na=False)) & (plot_df2["idx"] % label_every == 0)
-    else:
-        mask_rotulo = (plot_df2["idx"] % label_every == 0)
-
-    plot_df_labels = plot_df2.loc[mask_rotulo].copy()
-
-    base = alt.Chart(plot_df2).encode(
-        x=alt.X('ds:T', title='Data'),
-        y=alt.Y('valor:Q', title=y_label),
-        color=alt.Color('tipo:N', title='Série'),
-        tooltip=[
-            alt.Tooltip('ds:T', title='Data'),
-            alt.Tooltip('tipo:N', title='Série'),
-            alt.Tooltip('valor_fmt:Q', title='Valor')
-        ]
-    )
-
-    line = base.mark_line()
-    points = base.mark_point() if show_points else alt.Chart()
-
-    if show_labels:
-        text = alt.Chart(plot_df_labels).mark_text(align='left', dx=5, dy=-5).encode(
-            x='ds:T',
-            y='valor:Q',
-            text=alt.Text('valor_fmt:Q'),
-            color='tipo:N'
-        )
-        chart = (line + points + text).interactive()
-    else:
-        chart = (line + points).interactive()
-
-    st.altair_chart(chart, use_container_width=True)
-
-    # Agregado mensal + total
-    forecast_df["ano"] = forecast_df["ds"].dt.year
-    forecast_df["mes"] = forecast_df["ds"].dt.month
-    mensal = forecast_df.groupby(["ano", "mes"], as_index=False).agg(p50=("p50", "sum"))
-    total_2026 = float(forecast_df["p50"].sum())
+    # Tabelas e downloads
+    fc = fc_model.copy()
+    fc["ano"] = fc["ds"].dt.year
+    fc["mes"] = fc["ds"].dt.month
+    mensal = fc.groupby(["ano", "mes"], as_index=False).agg(p50=("p50", "sum"))
+    total_2026 = float(fc["p50"].sum())
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### 📦 Previsão semanal 2026 (p50)")
-        st.dataframe(forecast_df, use_container_width=True)
-        _download_csv(forecast_df, f"forecast_2026_{target_mode}_semanal.csv")
+        st.dataframe(fc, use_container_width=True)
+        _download_csv(fc, f"forecast_2026_{target_mode}_semanal.csv")
     with c2:
         st.markdown("### 🗓️ Previsão mensal 2026 (p50)")
         st.dataframe(mensal, use_container_width=True)
@@ -381,42 +422,6 @@ if run_btn:
 
     st.success(f"TOTAL 2026 (p50): {total_2026:,.0f}")
 
-else:
-    # Histórico (sem previsão) já com Altair e opções
-    st.subheader(f"📊 {y_label} (histórico)")
-    with st.expander("⚙️ Opções do gráfico"):
-        show_points = st.checkbox("Mostrar marcadores nos pontos", value=True, key="hist_points")
-        show_labels = st.checkbox("Mostrar valores como rótulos", value=False, key="hist_labels")
-        label_every = st.number_input("Exibir rótulo a cada N pontos", min_value=1, max_value=52, value=4, step=1, key="hist_every")
-
-    hist_plot = wk.copy().rename(columns={"y": "valor"})
-    hist_plot["tipo"] = "Histórico"
-    hist_plot["valor_fmt"] = hist_plot["valor"].round(0)
-    hist_plot = hist_plot.sort_values("ds")
-    hist_plot["idx"] = hist_plot.groupby("tipo").cumcount()
-    mask_rotulo = (hist_plot["idx"] % label_every == 0)
-    hist_labels = hist_plot.loc[mask_rotulo].copy()
-
-    base_h = alt.Chart(hist_plot).encode(
-        x=alt.X('ds:T', title='Data'),
-        y=alt.Y('valor:Q', title=y_label),
-        color=alt.Color('tipo:N', title='Série'),
-        tooltip=[
-            alt.Tooltip('ds:T', title='Data'),
-            alt.Tooltip('valor_fmt:Q', title='Valor')
-        ]
-    )
-    line_h = base_h.mark_line()
-    points_h = base_h.mark_point() if show_points else alt.Chart()
-    if show_labels:
-        text_h = alt.Chart(hist_labels).mark_text(align='left', dx=5, dy=-5).encode(
-            x='ds:T',
-            y='valor:Q',
-            text=alt.Text('valor_fmt:Q'),
-            color='tipo:N'
-        )
-        chart_h = (line_h + points_h + text_h).interactive()
-    else:
-        chart_h = (line_h + points_h).interactive()
-
-    st.altair_chart(chart_h, use_container_width=True)
+# Baseline resumo (se exibida)
+if isinstance(fc_base, pd.DataFrame) and len(fc_base):
+    st.info("Baseline exibida: Média por semana do ano calculada a partir do histórico atual.")
