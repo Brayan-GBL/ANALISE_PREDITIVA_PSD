@@ -192,7 +192,7 @@ if run_btn:
         future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
         fh = len(future_idx)
 
-                try:
+         try:
             # ---------- PyCaret (tentativas adaptativas) ----------
             from pycaret.time_series import TSForecastingExperiment
 
