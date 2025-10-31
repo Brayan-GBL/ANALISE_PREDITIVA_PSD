@@ -2,7 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from typing import Tuple
+from typing import Tuple, List, Optional
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error
 
 st.set_page_config(page_title="Forecast Pallets 2026", layout="wide")
 
@@ -38,14 +41,11 @@ def _build_arrival_date(df: pd.DataFrame) -> pd.Series:
     """
     col_rec = "DATA RECEBIMENTO UNICO"
     col_tri = "DATA TRIAGEM UNICO"
-
-    # garante colunas e converte pra datetime
     for c in [col_rec, col_tri]:
         if c not in df.columns:
             df[c] = pd.NaT
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    # atraso mediano onde existem as duas datas (triagem - recebimento)
     mask_both = df[col_rec].notna() & df[col_tri].notna()
     if mask_both.any():
         atraso = (df.loc[mask_both, col_tri] - df.loc[mask_both, col_rec]).dt.days
@@ -54,7 +54,6 @@ def _build_arrival_date(df: pd.DataFrame) -> pd.Series:
     else:
         atraso_med = 0
 
-    # imputação
     chegada = df[col_rec].copy()
     faltando = chegada.isna() & df[col_tri].notna()
     chegada.loc[faltando] = df.loc[faltando, col_tri] - pd.to_timedelta(atraso_med, unit="D")
@@ -83,7 +82,6 @@ def _weekly_agg(
             raise ValueError("Coluna 'TOTAL POR PALLET' não encontrada para soma de materiais.")
         df["TOTAL POR PALLET"] = pd.to_numeric(df["TOTAL POR PALLET"], errors="coerce").fillna(0)
 
-    # agregações
     if target_mode == "pallets":
         agg = (df
                .groupby(pd.Grouper(key="data_chegada", freq=freq))
@@ -99,7 +97,6 @@ def _weekly_agg(
                .rename(columns={"data_chegada": "ds"}))
         label = "Materiais (soma por semana)"
 
-    # linha do tempo contínua entre min e max
     if len(agg) == 0:
         return pd.DataFrame(columns=["ds", "y"]), label
 
@@ -111,21 +108,107 @@ def _weekly_agg(
     return out, label
 
 def _compute_future_index(last_ds: pd.Timestamp, end_year: int = 2026, freq: str = "W-MON") -> pd.DatetimeIndex:
-    """Cria índice semanal de (próxima semana) até 31/12/end_year."""
-    # próxima semana alinhada a segunda-feira
+    """Cria índice semanal de (próxima semana) até 31/12/end_year, filtrando só 2026."""
     if pd.isna(last_ds):
         start = pd.Timestamp(f"{end_year}-01-01")
     else:
         start = (last_ds + pd.offsets.Week(weekday=0))
     end = pd.Timestamp(f"{end_year}-12-31")
     future_idx = pd.date_range(start, end, freq=freq)
-    # mantém apenas 2026
     future_idx = future_idx[(future_idx >= pd.Timestamp("2026-01-01")) & (future_idx <= pd.Timestamp("2026-12-31"))]
     return future_idx
 
 def _download_csv(df: pd.DataFrame, filename: str):
     st.download_button("⬇️ Baixar CSV", data=df.to_csv(index=False).encode("utf-8"),
                        file_name=filename, mime="text/csv")
+
+# ===================== Model (sklearn) =====================
+def _select_lags(n_points: int) -> List[int]:
+    """Define lags dinamicamente conforme tamanho do histórico."""
+    base = [1, 2, 4, 8, 12, 26, 52]
+    return [L for L in base if L < n_points]
+
+def _make_features(wk_df: pd.DataFrame, lags: List[int], rolls: Optional[List[int]] = None) -> pd.DataFrame:
+    df = wk_df.copy().sort_values("ds").reset_index(drop=True)
+    df["week"] = df["ds"].dt.isocalendar().week.astype(int)
+    df["month"] = df["ds"].dt.month.astype(int)
+    for L in lags:
+        df[f"lag_{L}"] = df["y"].shift(L)
+    if rolls:
+        for W in rolls:
+            df[f"rollmean_{W}"] = df["y"].shift(1).rolling(W).mean()
+    return df.dropna().reset_index(drop=True)
+
+def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
+    """HistGradientBoosting com CV temporal (quando possível) + previsão recursiva."""
+    n = len(wk_df)
+    lags = _select_lags(n)
+    # janelas de rolling compatíveis com o histórico
+    rolls = [x for x in [4, 8, 12, 26] if x < n]
+
+    # se a série for muito curta, evita erro e usa só lag_1
+    if not lags:
+        lags = [1]
+
+    feat = _make_features(wk_df, lags, rolls)
+    if feat.empty:
+        # histórico curto demais p/ features -> fallback sazonal
+        return _seasonal_fallback(wk_df, future_idx), None
+
+    y = feat["y"].values
+    X = feat.drop(columns=["ds", "y"]).values
+
+    maes = []
+    splits = 4
+    # ajusta número de splits para não quebrar
+    while splits > 1:
+        try:
+            tscv = TimeSeriesSplit(n_splits=splits)
+            for tr, te in tscv.split(X):
+                m = HistGradientBoostingRegressor(random_state=42)
+                m.fit(X[tr], y[tr])
+                p = m.predict(X[te])
+                maes.append(mean_absolute_error(y[te], p))
+            break
+        except Exception:
+            splits -= 1
+    mae_cv = float(np.median(maes)) if maes else None
+
+    # treina final em todo histórico
+    final = HistGradientBoostingRegressor(random_state=42)
+    final.fit(X, y)
+
+    # previsão recursiva
+    hist_for_fc = feat[["ds", "y"]].copy()
+    rows = []
+    for d in future_idx:
+        # montar linha de features a partir do histórico + previsões
+        row = {"ds": d, "week": d.isocalendar().week, "month": d.month}
+        # lags
+        for L in lags:
+            row[f"lag_{L}"] = hist_for_fc["y"].iloc[-L]
+        # rolls
+        for W in rolls:
+            row[f"rollmean_{W}"] = hist_for_fc["y"].iloc[-W:].mean()
+
+        Xn = pd.DataFrame([row]).drop(columns=["ds"]).values
+        yhat = float(final.predict(Xn))
+        yhat = max(0.0, yhat)  # sem negativos
+        rows.append({"ds": d, "p50": yhat})
+        hist_for_fc = pd.concat([hist_for_fc, pd.DataFrame([{"ds": d, "y": yhat}])], ignore_index=True)
+
+    fc = pd.DataFrame(rows)
+    return fc, mae_cv
+
+def _seasonal_fallback(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
+    """Média por semana do ano, fallback simples e robusto."""
+    hist = wk_df.copy()
+    hist["week"] = hist["ds"].dt.isocalendar().week.astype(int)
+    seasonal = hist.groupby("week")["y"].mean()
+    fut = pd.DataFrame({"ds": future_idx})
+    fut["week"] = fut["ds"].dt.isocalendar().week.astype(int)
+    fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
+    return fut[["ds", "p50"]]
 
 # ============== Sidebar / Inputs ==============
 st.sidebar.title("Configuração")
@@ -181,132 +264,23 @@ if not len(wk):
     st.info("Sem dados no histórico para plotar.")
     st.stop()
 
-# ===================== Modelagem (opcional via botão) =====================
+# ===================== Modelagem (sklearn) =====================
 if run_btn:
-    with st.spinner("Treinando modelos..."):
-        best_name = None
-        metrics_note = ""
-        forecast_df = None
-
+    with st.spinner("Treinando e prevendo..."):
         future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
-        fh = len(future_idx)
+        if len(future_idx) == 0:
+            st.error("Não há semanas de 2026 a prever com a frequência atual.")
+            st.stop()
 
-        try:
-            # ---------- PyCaret (tentativas adaptativas) ----------
-            from pycaret.time_series import TSForecastingExperiment
-
-            # Série semanal + imputação ANTES do setup
-            series = wk.set_index("ds")["y"].asfreq("W-MON")
-            series = series.ffill().fillna(0)
-
-            # Função util p/ tentar diferentes combinações
-            def try_pycaret(fh_try, fold_try):
-                exp = TSForecastingExperiment()
-                exp.setup(
-                    data=series,
-                    fh=fh_try,
-                    fold=fold_try,
-                    session_id=42,
-                    verbose=False,
-                    seasonal_period="auto",
-                    transform_target=True,
-                )
-                best_local = exp.compare_models(sort="MASE", n_select=1, turbo=True)
-                final_local = exp.finalize_model(best_local)
-                preds_local = exp.predict_model(final_local, fh=fh_try)
-                return exp, best_local, preds_local
-
-            # 1) Tenta com fh completo e fold=2/1
-            attempt_ok = False
-            for fh_try, fold_try in [(fh, 2), (fh, 1)]:
-                if attempt_ok: break
-                try:
-                    exp, best, preds = try_pycaret(fh_try, fold_try)
-                    best_name = str(best)
-                    attempt_ok = True
-                except Exception:
-                    continue
-
-            # 2) Se ainda não deu, reduz fh para seleção (ex.: 26 semanas)
-            if not attempt_ok:
-                fh_sel = int(min(26, max(4, fh)))
-                try:
-                    exp, best, preds = try_pycaret(fh_sel, 2)
-                    best_name = str(best)
-                    attempt_ok = True
-                except Exception:
-                    pass
-
-            if not attempt_ok:
-                raise RuntimeError("Not Enough Data Points mesmo após tentativas (fold/fh).")
-
-            # Normaliza saída vinda do compare/finalize
-            if isinstance(preds, pd.Series):
-                f_tmp = preds.rename("p50").to_frame()
-            else:
-                if "y_pred" in preds.columns:
-                    f_tmp = preds[["y_pred"]].rename(columns={"y_pred": "p50"})
-                elif "Label" in preds.columns:
-                    f_tmp = preds[["Label"]].rename(columns={"Label": "p50"})
-                else:
-                    f_tmp = preds.iloc[:, [-1]].rename(columns={preds.columns[-1]: "p50"})
-            f_tmp.index = pd.to_datetime(f_tmp.index)
-            f_tmp = f_tmp.reset_index().rename(columns={"index": "ds"})
-
-            # Se a seleção foi feita com fh reduzido, refaça previsão para fh completo
-            if f_tmp["ds"].max() < pd.Timestamp("2026-12-31"):
-                exp_full = TSForecastingExperiment()
-                exp_full.setup(
-                    data=series,
-                    fh=fh,
-                    fold=1,
-                    session_id=42,
-                    verbose=False,
-                    seasonal_period="auto",
-                    transform_target=True,
-                )
-                model_full = exp_full.create_model(best)
-                final_full = exp_full.finalize_model(model_full)
-                preds_full = exp_full.predict_model(final_full, fh=fh)
-
-                if isinstance(preds_full, pd.Series):
-                    f = preds_full.rename("p50").to_frame()
-                else:
-                    if "y_pred" in preds_full.columns:
-                        f = preds_full[["y_pred"]].rename(columns={"y_pred": "p50"})
-                    elif "Label" in preds_full.columns:
-                        f = preds_full[["Label"]].rename(columns={"Label": "p50"})
-                    else:
-                        f = preds_full.iloc[:, [-1]].rename(columns={preds_full.columns[-1]: "p50"})
-                f.index = pd.to_datetime(f.index)
-                f = f.reset_index().rename(columns={"index": "ds"})
-            else:
-                f = f_tmp
-
-            # filtra só 2026
-            f = f[(f["ds"] >= pd.Timestamp("2026-01-01")) & (f["ds"] <= pd.Timestamp("2026-12-31"))]
-            if f.empty:
-                raise RuntimeError("Previsão vazia para 2026 após PyCaret.")
-            forecast_df = f.copy()
-            metrics_note = "Modelo selecionado via PyCaret (ajustes automáticos de fold/fh)."
-
-        except Exception as e:
-            # ---------- Fallback: sazonalidade por semana do ano ----------
-            metrics_note = f"PyCaret indisponível ({e}). Usando fallback sazonal (média por semana do ano)."
-            hist = wk.copy()
-            hist["week"] = hist["ds"].dt.isocalendar().week.astype(int)
-            seasonal = hist.groupby("week")["y"].mean()
-            fut = pd.DataFrame({"ds": future_idx})
-            fut["week"] = fut["ds"].dt.isocalendar().week.astype(int)
-            fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
-            forecast_df = fut[["ds", "p50"]].copy()
-            best_name = "Sazonal (média por semana do ano)"
+        forecast_df, mae_cv = _forecast_sklearn(wk, future_idx)
+        best_name = "HistGradientBoosting (scikit-learn)"
+        metrics_note = f"Backtest MAE (mediano): {mae_cv:.2f}" if mae_cv is not None else "Backtest indisponível (histórico curto)."
 
     st.subheader("Modelo escolhido")
     st.write(best_name)
     st.caption(metrics_note)
 
-    # Plot histórico + previsão (com Altair e rótulos)
+    # Plot histórico + previsão (Altair com rótulos)
     hist_df = wk.copy()
     hist_df["tipo"] = "Histórico"
     fc_plot = forecast_df.copy()
@@ -382,7 +356,7 @@ if run_btn:
     st.success(f"TOTAL 2026 (p50): {total_2026:,.0f}")
 
 else:
-    # Se ainda não clicou em treinar, mostre o histórico com Altair já com labels
+    # Histórico (sem previsão) já com Altair e opções
     st.subheader(f"📊 {y_label} (histórico)")
     with st.expander("⚙️ Opções do gráfico"):
         show_points = st.checkbox("Mostrar marcadores nos pontos", value=True, key="hist_points")
