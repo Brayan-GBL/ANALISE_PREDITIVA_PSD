@@ -140,25 +140,23 @@ def _make_features(wk_df: pd.DataFrame, lags: List[int], rolls: Optional[List[in
     return df.dropna().reset_index(drop=True)
 
 def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
-    """HistGradientBoosting com CV temporal (quando possível) + previsão recursiva robusta."""
+    """HistGradientBoosting com CV temporal + previsão recursiva, mantendo o MESMO espaço de features do treino."""
     n = len(wk_df)
-    lags_all = _select_lags(n)           # ex.: [1,2,4,8,12,26,52] filtrado por n
-    rolls_all = [x for x in [4, 8, 12, 26] if x < n]
+    lags_all = _select_lags(n) or [1]                 # ex.: [1,2,4,8,12,26,52] filtrado por n; se vazio, usa [1]
+    rolls_all = [x for x in [4, 8, 12, 26] if x < n]  # rollings possíveis dado o tamanho do histórico
 
-    # se a série for muito curta, evita erro e usa só lag_1
-    if not lags_all:
-        lags_all = [1]
-
-    # ----- features do histórico para treino
+    # 1) Monta features do histórico (treino)
     feat = _make_features(wk_df, lags_all, rolls_all)
     if feat.empty:
-        # histórico curto demais p/ features -> fallback sazonal
+        # histórico curto demais -> fallback sazonal
         return _seasonal_fallback(wk_df, future_idx), None
 
+    # Colunas de features (ordem fixa) usadas no treino
+    feature_cols = [c for c in feat.columns if c not in ["ds", "y"]]
     y = feat["y"].values
-    X = feat.drop(columns=["ds", "y"]).values
+    X = feat[feature_cols].values
 
-    # ----- CV temporal (ajusta splits se necessário)
+    # 2) CV temporal (ajusta n_splits se necessário)
     maes = []
     splits = 4
     while splits > 1:
@@ -174,41 +172,54 @@ def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
             splits -= 1
     mae_cv = float(np.median(maes)) if maes else None
 
-    # ----- treino final
+    # 3) Treino final no histórico todo (mesmo espaço de features)
     final = HistGradientBoostingRegressor(random_state=42)
     final.fit(X, y)
 
-    # ----- previsão recursiva (ROBUSTA A LAGS GRANDES)
+    # 4) Previsão recursiva: SEMPRE respeitando `feature_cols`
     hist_for_fc = feat[["ds", "y"]].copy()
     rows = []
 
     for d in future_idx:
-        # a cada passo, mantenha apenas lags que cabem no histórico atual
-        curr_len = len(hist_for_fc)
-        lags = [L for L in lags_all if L <= curr_len] or [1]
+        s = hist_for_fc["y"]
+        curr_len = len(s)
+        last_val = float(s.iloc[-1]) if curr_len > 0 else 0.0
 
-        # rolls também seguros (se janela > histórico, usa o que tiver)
-        rolls = [W for W in rolls_all if W <= curr_len]
+        # Monta um dict com TODAS as colunas de feature usadas no treino
+        row_feat = {}
+        for col in feature_cols:
+            if col == "week":
+                row_feat[col] = int(d.isocalendar().week)
+            elif col == "month":
+                row_feat[col] = int(d.month)
+            elif col.startswith("lag_"):
+                # lag_L -> usa s[-L] se existir; senão, fallback = último valor conhecido
+                try:
+                    L = int(col.split("_", 1)[1])
+                except Exception:
+                    L = 1
+                if curr_len >= L:
+                    row_feat[col] = float(s.iloc[-L])
+                else:
+                    row_feat[col] = last_val
+            elif col.startswith("rollmean_"):
+                # rollmean_W -> média dos últimos W; se W > histórico, usa média do que tiver; se vazio, usa last_val
+                try:
+                    W = int(col.split("_", 1)[1])
+                except Exception:
+                    W = min(4, curr_len)
+                window = min(W, curr_len)
+                row_feat[col] = float(s.iloc[-window:].mean()) if window > 0 else last_val
+            else:
+                # Qualquer coluna inesperada recebe fallback neutro
+                row_feat[col] = last_val
 
-        row = {"ds": d, "week": d.isocalendar().week, "month": d.month}
+        # Garante MESMA ORDEM de colunas que no treino
+        Xn = np.array([[row_feat[c] for c in feature_cols]], dtype=float)
 
-        # lags: se por algum motivo não couber, usa o último valor conhecido como fallback
-        last_val = float(hist_for_fc["y"].iloc[-1])
-        for L in lags:
-            try:
-                row[f"lag_{L}"] = float(hist_for_fc["y"].iloc[-L])
-            except Exception:
-                row[f"lag_{L}"] = last_val
-
-        # rollings: mean da janela disponível (se janela > histórico, pega tudo)
-        for W in rolls:
-            row[f"rollmean_{W}"] = float(hist_for_fc["y"].iloc[-W:].mean())
-
-        # se não houver nenhuma rolling, ainda é válido
-        Xn = pd.DataFrame([row]).drop(columns=["ds"]).values
+        # Predição e atualização do histórico para o próximo passo
         yhat = float(final.predict(Xn))
         yhat = max(0.0, yhat)  # sem negativos
-
         rows.append({"ds": d, "p50": yhat})
         hist_for_fc = pd.concat([hist_for_fc, pd.DataFrame([{"ds": d, "y": yhat}])], ignore_index=True)
 
