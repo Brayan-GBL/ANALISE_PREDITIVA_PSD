@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from io import BytesIO
 from typing import Tuple
 
 st.set_page_config(page_title="Forecast Pallets 2026", layout="wide")
@@ -192,7 +191,7 @@ if run_btn:
         future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
         fh = len(future_idx)
 
-         try:
+        try:
             # ---------- PyCaret (tentativas adaptativas) ----------
             from pycaret.time_series import TSForecastingExperiment
 
@@ -217,7 +216,7 @@ if run_btn:
                 preds_local = exp.predict_model(final_local, fh=fh_try)
                 return exp, best_local, preds_local
 
-            # 1) Tenta com fh completo e fold=2
+            # 1) Tenta com fh completo e fold=2/1
             attempt_ok = False
             for fh_try, fold_try in [(fh, 2), (fh, 1)]:
                 if attempt_ok: break
@@ -225,7 +224,7 @@ if run_btn:
                     exp, best, preds = try_pycaret(fh_try, fold_try)
                     best_name = str(best)
                     attempt_ok = True
-                except Exception as _:
+                except Exception:
                     continue
 
             # 2) Se ainda não deu, reduz fh para seleção (ex.: 26 semanas)
@@ -235,7 +234,7 @@ if run_btn:
                     exp, best, preds = try_pycaret(fh_sel, 2)
                     best_name = str(best)
                     attempt_ok = True
-                except Exception as _:
+                except Exception:
                     pass
 
             if not attempt_ok:
@@ -256,7 +255,6 @@ if run_btn:
 
             # Se a seleção foi feita com fh reduzido, refaça previsão para fh completo
             if f_tmp["ds"].max() < pd.Timestamp("2026-12-31"):
-                # Re-configura exp com fh completo e o mesmo data
                 exp_full = TSForecastingExperiment()
                 exp_full.setup(
                     data=series,
@@ -267,12 +265,10 @@ if run_btn:
                     seasonal_period="auto",
                     transform_target=True,
                 )
-                # Recria o mesmo tipo de modelo vencedor (por id/obj)
                 model_full = exp_full.create_model(best)
                 final_full = exp_full.finalize_model(model_full)
                 preds_full = exp_full.predict_model(final_full, fh=fh)
 
-                # normaliza de novo
                 if isinstance(preds_full, pd.Series):
                     f = preds_full.rename("p50").to_frame()
                 else:
@@ -305,7 +301,6 @@ if run_btn:
             fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
             forecast_df = fut[["ds", "p50"]].copy()
             best_name = "Sazonal (média por semana do ano)"
-
 
     st.subheader("Modelo escolhido")
     st.write(best_name)
@@ -387,7 +382,7 @@ if run_btn:
     st.success(f"TOTAL 2026 (p50): {total_2026:,.0f}")
 
 else:
-    # Se ainda não clicou em treinar, pelo menos mostre o histórico com Altair já com labels
+    # Se ainda não clicou em treinar, mostre o histórico com Altair já com labels
     st.subheader(f"📊 {y_label} (histórico)")
     with st.expander("⚙️ Opções do gráfico"):
         show_points = st.checkbox("Mostrar marcadores nos pontos", value=True, key="hist_points")
