@@ -192,45 +192,107 @@ if run_btn:
         future_idx = _compute_future_index(wk["ds"].max(), end_year=2026, freq="W-MON")
         fh = len(future_idx)
 
-        try:
-            # ---------- PyCaret ----------
+                try:
+            # ---------- PyCaret (tentativas adaptativas) ----------
             from pycaret.time_series import TSForecastingExperiment
-
-            exp = TSForecastingExperiment()
 
             # Série semanal + imputação ANTES do setup
             series = wk.set_index("ds")["y"].asfreq("W-MON")
             series = series.ffill().fillna(0)
 
-            exp.setup(
-                data=series,
-                fh=fh,
-                fold=3,
-                session_id=42,
-                verbose=False,
-                seasonal_period="auto",
-                transform_target=True,
-            )
-            best = exp.compare_models(sort="MASE", n_select=1, turbo=True)
-            best_name = str(best)
-            final_best = exp.finalize_model(best)
-            preds = exp.predict_model(final_best, fh=fh)
+            # Função util p/ tentar diferentes combinações
+            def try_pycaret(fh_try, fold_try):
+                exp = TSForecastingExperiment()
+                exp.setup(
+                    data=series,
+                    fh=fh_try,
+                    fold=fold_try,
+                    session_id=42,
+                    verbose=False,
+                    seasonal_period="auto",
+                    transform_target=True,
+                )
+                best_local = exp.compare_models(sort="MASE", n_select=1, turbo=True)
+                final_local = exp.finalize_model(best_local)
+                preds_local = exp.predict_model(final_local, fh=fh_try)
+                return exp, best_local, preds_local
 
-            # Normaliza saída
+            # 1) Tenta com fh completo e fold=2
+            attempt_ok = False
+            for fh_try, fold_try in [(fh, 2), (fh, 1)]:
+                if attempt_ok: break
+                try:
+                    exp, best, preds = try_pycaret(fh_try, fold_try)
+                    best_name = str(best)
+                    attempt_ok = True
+                except Exception as _:
+                    continue
+
+            # 2) Se ainda não deu, reduz fh para seleção (ex.: 26 semanas)
+            if not attempt_ok:
+                fh_sel = int(min(26, max(4, fh)))
+                try:
+                    exp, best, preds = try_pycaret(fh_sel, 2)
+                    best_name = str(best)
+                    attempt_ok = True
+                except Exception as _:
+                    pass
+
+            if not attempt_ok:
+                raise RuntimeError("Not Enough Data Points mesmo após tentativas (fold/fh).")
+
+            # Normaliza saída vinda do compare/finalize
             if isinstance(preds, pd.Series):
-                f = preds.rename("p50").to_frame()
+                f_tmp = preds.rename("p50").to_frame()
             else:
                 if "y_pred" in preds.columns:
-                    f = preds[["y_pred"]].rename(columns={"y_pred": "p50"})
+                    f_tmp = preds[["y_pred"]].rename(columns={"y_pred": "p50"})
                 elif "Label" in preds.columns:
-                    f = preds[["Label"]].rename(columns={"Label": "p50"})
+                    f_tmp = preds[["Label"]].rename(columns={"Label": "p50"})
                 else:
-                    f = preds.iloc[:, [-1]].rename(columns={preds.columns[-1]: "p50"})
-            f.index = pd.to_datetime(f.index)
-            f = f.reset_index().rename(columns={"index": "ds"})
+                    f_tmp = preds.iloc[:, [-1]].rename(columns={preds.columns[-1]: "p50"})
+            f_tmp.index = pd.to_datetime(f_tmp.index)
+            f_tmp = f_tmp.reset_index().rename(columns={"index": "ds"})
+
+            # Se a seleção foi feita com fh reduzido, refaça previsão para fh completo
+            if f_tmp["ds"].max() < pd.Timestamp("2026-12-31"):
+                # Re-configura exp com fh completo e o mesmo data
+                exp_full = TSForecastingExperiment()
+                exp_full.setup(
+                    data=series,
+                    fh=fh,
+                    fold=1,
+                    session_id=42,
+                    verbose=False,
+                    seasonal_period="auto",
+                    transform_target=True,
+                )
+                # Recria o mesmo tipo de modelo vencedor (por id/obj)
+                model_full = exp_full.create_model(best)
+                final_full = exp_full.finalize_model(model_full)
+                preds_full = exp_full.predict_model(final_full, fh=fh)
+
+                # normaliza de novo
+                if isinstance(preds_full, pd.Series):
+                    f = preds_full.rename("p50").to_frame()
+                else:
+                    if "y_pred" in preds_full.columns:
+                        f = preds_full[["y_pred"]].rename(columns={"y_pred": "p50"})
+                    elif "Label" in preds_full.columns:
+                        f = preds_full[["Label"]].rename(columns={"Label": "p50"})
+                    else:
+                        f = preds_full.iloc[:, [-1]].rename(columns={preds_full.columns[-1]: "p50"})
+                f.index = pd.to_datetime(f.index)
+                f = f.reset_index().rename(columns={"index": "ds"})
+            else:
+                f = f_tmp
+
+            # filtra só 2026
             f = f[(f["ds"] >= pd.Timestamp("2026-01-01")) & (f["ds"] <= pd.Timestamp("2026-12-31"))]
+            if f.empty:
+                raise RuntimeError("Previsão vazia para 2026 após PyCaret.")
             forecast_df = f.copy()
-            metrics_note = "Modelo selecionado via PyCaret (melhor por MASE)."
+            metrics_note = "Modelo selecionado via PyCaret (ajustes automáticos de fold/fh)."
 
         except Exception as e:
             # ---------- Fallback: sazonalidade por semana do ano ----------
@@ -243,6 +305,7 @@ if run_btn:
             fut["p50"] = fut["week"].map(seasonal).fillna(hist["y"].mean())
             forecast_df = fut[["ds", "p50"]].copy()
             best_name = "Sazonal (média por semana do ano)"
+
 
     st.subheader("Modelo escolhido")
     st.write(best_name)
