@@ -197,7 +197,10 @@ if run_btn:
             from pycaret.time_series import TSForecastingExperiment
 
             exp = TSForecastingExperiment()
+
+            # Série semanal + imputação ANTES do setup
             series = wk.set_index("ds")["y"].asfreq("W-MON")
+            series = series.ffill().fillna(0)
 
             exp.setup(
                 data=series,
@@ -206,7 +209,6 @@ if run_btn:
                 session_id=42,
                 verbose=False,
                 seasonal_period="auto",
-                imputation_method="ffill",
                 transform_target=True,
             )
             best = exp.compare_models(sort="MASE", n_select=1, turbo=True)
