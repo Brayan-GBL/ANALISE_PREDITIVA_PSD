@@ -253,7 +253,7 @@ target_mode = st.sidebar.radio("Alvo da previsão", ["pallets", "materiais"], in
 uploaded = st.sidebar.file_uploader("Enviar arquivo (ANALISE_PSD)", type=["csv", "xlsx", "xls"])
 
 # Botões
-train_btn = st.sidebar.button("🚀 Treinar / Atualizar previsão 2026", type="primary")
+train_btn = st.sidebar.button("Treinar / Atualizar previsão 2026", type="primary")
 show_baseline = st.sidebar.checkbox("➕ Mostrar baseline sazonal (média por semana do ano)", value=False)
 
 st.title("Previsão 2026 • Pallets / Materiais (semanal)")
