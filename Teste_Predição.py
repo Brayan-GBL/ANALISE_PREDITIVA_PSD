@@ -140,17 +140,17 @@ def _make_features(wk_df: pd.DataFrame, lags: List[int], rolls: Optional[List[in
     return df.dropna().reset_index(drop=True)
 
 def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
-    """HistGradientBoosting com CV temporal (quando possível) + previsão recursiva."""
+    """HistGradientBoosting com CV temporal (quando possível) + previsão recursiva robusta."""
     n = len(wk_df)
-    lags = _select_lags(n)
-    # janelas de rolling compatíveis com o histórico
-    rolls = [x for x in [4, 8, 12, 26] if x < n]
+    lags_all = _select_lags(n)           # ex.: [1,2,4,8,12,26,52] filtrado por n
+    rolls_all = [x for x in [4, 8, 12, 26] if x < n]
 
     # se a série for muito curta, evita erro e usa só lag_1
-    if not lags:
-        lags = [1]
+    if not lags_all:
+        lags_all = [1]
 
-    feat = _make_features(wk_df, lags, rolls)
+    # ----- features do histórico para treino
+    feat = _make_features(wk_df, lags_all, rolls_all)
     if feat.empty:
         # histórico curto demais p/ features -> fallback sazonal
         return _seasonal_fallback(wk_df, future_idx), None
@@ -158,9 +158,9 @@ def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
     y = feat["y"].values
     X = feat.drop(columns=["ds", "y"]).values
 
+    # ----- CV temporal (ajusta splits se necessário)
     maes = []
     splits = 4
-    # ajusta número de splits para não quebrar
     while splits > 1:
         try:
             tscv = TimeSeriesSplit(n_splits=splits)
@@ -174,26 +174,41 @@ def _forecast_sklearn(wk_df: pd.DataFrame, future_idx: pd.DatetimeIndex):
             splits -= 1
     mae_cv = float(np.median(maes)) if maes else None
 
-    # treina final em todo histórico
+    # ----- treino final
     final = HistGradientBoostingRegressor(random_state=42)
     final.fit(X, y)
 
-    # previsão recursiva
+    # ----- previsão recursiva (ROBUSTA A LAGS GRANDES)
     hist_for_fc = feat[["ds", "y"]].copy()
     rows = []
-    for d in future_idx:
-        # montar linha de features a partir do histórico + previsões
-        row = {"ds": d, "week": d.isocalendar().week, "month": d.month}
-        # lags
-        for L in lags:
-            row[f"lag_{L}"] = hist_for_fc["y"].iloc[-L]
-        # rolls
-        for W in rolls:
-            row[f"rollmean_{W}"] = hist_for_fc["y"].iloc[-W:].mean()
 
+    for d in future_idx:
+        # a cada passo, mantenha apenas lags que cabem no histórico atual
+        curr_len = len(hist_for_fc)
+        lags = [L for L in lags_all if L <= curr_len] or [1]
+
+        # rolls também seguros (se janela > histórico, usa o que tiver)
+        rolls = [W for W in rolls_all if W <= curr_len]
+
+        row = {"ds": d, "week": d.isocalendar().week, "month": d.month}
+
+        # lags: se por algum motivo não couber, usa o último valor conhecido como fallback
+        last_val = float(hist_for_fc["y"].iloc[-1])
+        for L in lags:
+            try:
+                row[f"lag_{L}"] = float(hist_for_fc["y"].iloc[-L])
+            except Exception:
+                row[f"lag_{L}"] = last_val
+
+        # rollings: mean da janela disponível (se janela > histórico, pega tudo)
+        for W in rolls:
+            row[f"rollmean_{W}"] = float(hist_for_fc["y"].iloc[-W:].mean())
+
+        # se não houver nenhuma rolling, ainda é válido
         Xn = pd.DataFrame([row]).drop(columns=["ds"]).values
         yhat = float(final.predict(Xn))
         yhat = max(0.0, yhat)  # sem negativos
+
         rows.append({"ds": d, "p50": yhat})
         hist_for_fc = pd.concat([hist_for_fc, pd.DataFrame([{"ds": d, "y": yhat}])], ignore_index=True)
 
