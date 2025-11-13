@@ -6,4 +6,4 @@ numpy
 openpyxl
 altair
 scikit-learn
-lxml
+requests
